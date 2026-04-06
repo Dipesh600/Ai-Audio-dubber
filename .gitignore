@@ -1,0 +1,33 @@
+# Dependencies
+node_modules/
+orchestrator/backend/node_modules/
+orchestrator/frontend/node_modules/
+
+# Environment
+.env
+.env.local
+.env.*.local
+
+# Generated files
+*.pyc
+__pycache__/
+*.sqlite
+*.sqlite3
+jobs.sqlite
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Claude
+.claude/
+
+# Uploads
+uploads_tmp/
+
+# Output (generated)
+output/
+
+# Build artifacts
+orchestrator/frontend/.next/
+orchestrator/frontend/out/

@@ -1,0 +1,9 @@
+node_modules
+logs
+*.log
+.git
+.gitignore
+README.md
+*.md
+tsconfig.json
+ecosystem.config.js

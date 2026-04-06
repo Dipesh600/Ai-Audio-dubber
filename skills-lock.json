@@ -1,0 +1,10 @@
+{
+  "version": 1,
+  "skills": {
+    "faster-whisper": {
+      "source": "theplasmak/faster-whisper",
+      "sourceType": "github",
+      "computedHash": "75b999323c0e2ea24fef6c1f7a0ded32fd4e2a1a92a9691c72eb10c961706fee"
+    }
+  }
+}
