@@ -13,72 +13,286 @@ current_dir = Path(__file__).resolve().parent
 project_root = current_dir.parent.parent
 sys.path.insert(0, str(project_root))
 
+# Load .env from project root
+try:
+    from dotenv import load_dotenv
+    load_dotenv(project_root / ".env")
+except ImportError:
+    pass  # dotenv not installed — rely on system env vars
+
 from core.paths import get_agent_output_dir
 from core.logger import get_logger
-import yt_dlp
 
 logger = get_logger("DownloaderAgent")
 
-# ── Invidious instances (public, no auth needed, no 403s) ──────────────────
-# Sorted by reliability — first available instance is used
-INVIDIOUS_INSTANCES = [
-    "https://invidious.privacyredirect.com",
-    "https://yewtu.be",
-    "https://invidious.snopyta.org",
-    "https://invidious.kavin.rocks",
-]
+# ── APIhut config ──────────────────────────────────────────────────────────
+APIHUT_ENDPOINT = "https://apihut.in/api/download/videos"
 
-AUDIO_FMT = (
-    'bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio/best'
-)
+# ── Platform detection ─────────────────────────────────────────────────────
+PLATFORM_PATTERNS = {
+    'youtube': [
+        r'(?:youtube\.com|youtu\.be|music\.youtube\.com)',
+    ],
+    'instagram': [
+        r'(?:instagram\.com|instagr\.am)',
+    ],
+    'facebook': [
+        r'(?:facebook\.com|fb\.watch|fb\.com)',
+    ],
+    'twitter': [
+        r'(?:twitter\.com|x\.com)',
+    ],
+    'linkedin': [
+        r'(?:linkedin\.com)',
+    ],
+    'tiktok': [
+        r'(?:tiktok\.com|vm\.tiktok\.com)',
+    ],
+}
 
-def fetch_json(url: str, retries: int = 3) -> dict:
-    """Fetch JSON from Invidious API with retry on failure."""
-    for attempt in range(retries):
-        try:
-            req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
-            with urllib.request.urlopen(req, timeout=30) as resp:
-                return json.loads(resp.read().decode('utf-8'))
-        except Exception as e:
-            logger.warning(f"Invidious fetch attempt {attempt+1} failed: {e}")
+
+def detect_platform(url: str) -> str:
+    """Detect which social media platform a URL belongs to."""
+    for platform, patterns in PLATFORM_PATTERNS.items():
+        for pat in patterns:
+            if re.search(pat, url, re.IGNORECASE):
+                return platform
+    return 'youtube'  # fallback
+
+
+def extract_video_id(url: str) -> str:
+    """Extract YouTube video ID from any YouTube URL format."""
+    patterns = [
+        r'(?:v=|/v/)([a-zA-Z0-9_-]{11})',
+        r'youtu\.be/([a-zA-Z0-9_-]{11})',
+        r'youtube\.com/shorts/([a-zA-Z0-9_-]{11})',
+        r'youtube\.com/embed/([a-zA-Z0-9_-]{11})',
+    ]
+    for pat in patterns:
+        m = re.search(pat, url)
+        if m:
+            return m.group(1)
     return None
 
 
-def get_invidious_instance() -> str:
-    """Find a working Invidious instance."""
-    for instance in INVIDIOUS_INSTANCES:
-        try:
-            req = urllib.request.Request(instance, headers={'User-Agent': 'Mozilla/5.0'})
-            urllib.request.urlopen(req, timeout=10)
-            logger.info(f"Using Invidious instance: {instance}")
-            return instance
-        except Exception:
-            continue
-    raise Exception("No working Invidious instance found")
+def sanitize_filename(title: str) -> str:
+    """Make a string safe for use as a filename."""
+    return "".join(c if c.isalnum() or c in ' -_.' else '_' for c in title).strip()
 
 
-def download_with_ffmpeg(url: str, output_path: str) -> bool:
-    """Download stream URL using ffmpeg (direct, no re-encoding = fast + lossless)."""
-    cmd = [
-        'ffmpeg', '-y', '-i', url,
-        '-c', 'copy', '-bsf:a', 'aac_adtstoasc',
-        '-max_muxing_queue_size', '9999',
-        output_path
-    ]
-    logger.info(f"Running ffmpeg...")
-    result = subprocess.run(cmd, capture_output=True, text=True, timeout=7200)
-    if result.returncode != 0:
-        logger.error(f"ffmpeg failed: {result.stderr[-500:]}")
-        return False
-    return True
+# ── APIhut download method (primary) ──────────────────────────────────────
 
+def download_with_apihut(url: str, platform: str, video_path: str, audio_path: str) -> dict:
+    """
+    Download video via APIhut API.
+    
+    Returns dict with 'video_path' and 'audio_path' if successful, None on failure.
+    
+    APIhut behavior per their docs:
+      - YouTube/LinkedIn: returns video buffer in response
+      - Instagram/Facebook: returns download URL as JSON
+    """
+    api_key = os.environ.get("APIHUT_API_KEY", "")
+    if not api_key:
+        logger.warning("APIHUT_API_KEY not set — skipping APIhut download.")
+        return None
+
+    logger.info(f"[APIhut] API key loaded: {api_key[:8]}...{api_key[-4:]}")
+
+    try:
+        # Build platform-specific payload
+        payload_dict = {
+            "video_url": url,
+            "type": platform,
+        }
+
+        # YouTube requires with_metadata flag per APIhut docs
+        # Without it, YouTube downloads fail (returns error/empty response)
+        if platform == 'youtube':
+            payload_dict["with_metadata"] = True
+
+        payload = json.dumps(payload_dict).encode('utf-8')
+
+        logger.info(f"[APIhut] POST {APIHUT_ENDPOINT}")
+        logger.info(f"[APIhut] Payload: {json.dumps(payload_dict)}")
+
+        req = urllib.request.Request(
+            APIHUT_ENDPOINT,
+            data=payload,
+            headers={
+                'Content-Type': 'application/json',
+                'X-Avatar-Key': api_key,
+                'User-Agent': 'SetuDubber/1.0',
+            },
+            method='POST',
+        )
+
+        os.makedirs(os.path.dirname(video_path), exist_ok=True)
+        os.makedirs(os.path.dirname(audio_path), exist_ok=True)
+
+        # YouTube returns binary buffer which can be large — use longer timeout
+        timeout = 300 if platform == 'youtube' else 180
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            content_type = resp.headers.get('Content-Type', '')
+            status = resp.status
+            content_length = resp.headers.get('Content-Length', 'unknown')
+
+            logger.info(f"[APIhut] Response: HTTP {status}, Content-Type: {content_type}, Content-Length: {content_length}")
+
+            if status != 200:
+                logger.warning(f"[APIhut] Non-200 response: {status}")
+                return None
+
+            # Read the full response body
+            raw_data = resp.read()
+            logger.info(f"[APIhut] Received {len(raw_data)} bytes")
+
+            if len(raw_data) == 0:
+                logger.warning("[APIhut] Empty response body")
+                return None
+
+            # Determine if it's JSON or binary
+            is_json = 'application/json' in content_type or 'text/' in content_type
+
+            # If content-type is ambiguous, try to detect from first bytes
+            if not is_json:
+                try:
+                    # Check if it starts like JSON
+                    first_bytes = raw_data[:20].decode('utf-8', errors='ignore').strip()
+                    if first_bytes.startswith('{') or first_bytes.startswith('['):
+                        is_json = True
+                        logger.info("[APIhut] Detected JSON from content inspection")
+                except:
+                    pass
+
+            if is_json:
+                # ── JSON response (could contain URL or buffer reference) ──
+                try:
+                    data = json.loads(raw_data.decode('utf-8'))
+                except:
+                    # Maybe it's actually binary disguised with wrong content-type
+                    logger.info("[APIhut] JSON parse failed — treating as binary video")
+                    is_json = False
+
+            if is_json:
+                logger.info(f"[APIhut] JSON response: {json.dumps(data)[:500]}")
+
+                # Check for error in response
+                if isinstance(data, dict) and data.get('error'):
+                    logger.warning(f"[APIhut] API error: {data.get('error')}")
+                    return None
+
+                # Extract download URL from various possible response formats
+                download_url = None
+                if isinstance(data, dict):
+                    # Try direct fields
+                    for key in ['download_url', 'url', 'video_url', 'link', 'videoUrl', 'downloadUrl']:
+                        if data.get(key) and isinstance(data[key], str) and data[key].startswith('http'):
+                            download_url = data[key]
+                            break
+                    
+                    # Try nested data object
+                    if not download_url and isinstance(data.get('data'), dict):
+                        for key in ['download_url', 'url', 'video_url', 'link']:
+                            if data['data'].get(key) and isinstance(data['data'][key], str):
+                                download_url = data['data'][key]
+                                break
+                    
+                    # Try nested data array (multiple qualities)
+                    if not download_url and isinstance(data.get('data'), list) and len(data['data']) > 0:
+                        for item in data['data']:
+                            if isinstance(item, dict):
+                                for key in ['url', 'download_url', 'video_url', 'link']:
+                                    if item.get(key) and isinstance(item[key], str):
+                                        download_url = item[key]
+                                        break
+                            if download_url:
+                                break
+
+                    # Check if there's a 'buffer' field with base64 data
+                    if not download_url and data.get('buffer'):
+                        import base64
+                        logger.info("[APIhut] Found base64 buffer in response. Decoding...")
+                        try:
+                            video_data = base64.b64decode(data['buffer'])
+                            with open(video_path, 'wb') as f:
+                                f.write(video_data)
+                            if os.path.exists(video_path) and os.path.getsize(video_path) > 1000:
+                                logger.info(f"[APIhut] Video saved from buffer: {video_path} ({os.path.getsize(video_path) / 1024 / 1024:.1f} MB)")
+                                _extract_audio(video_path, audio_path)
+                                return {"video_path": video_path, "audio_path": audio_path}
+                        except Exception as e:
+                            logger.warning(f"[APIhut] Base64 decode failed: {e}")
+
+                if download_url:
+                    logger.info(f"[APIhut] Downloading video from URL: {download_url[:100]}...")
+                    dl_req = urllib.request.Request(download_url, headers={'User-Agent': 'Mozilla/5.0'})
+                    with urllib.request.urlopen(dl_req, timeout=300) as dl_resp:
+                        with open(video_path, 'wb') as f:
+                            while True:
+                                chunk = dl_resp.read(8192)
+                                if not chunk:
+                                    break
+                                f.write(chunk)
+
+                    if os.path.exists(video_path) and os.path.getsize(video_path) > 1000:
+                        logger.info(f"[APIhut] Video saved: {video_path} ({os.path.getsize(video_path) / 1024 / 1024:.1f} MB)")
+                        _extract_audio(video_path, audio_path)
+                        return {"video_path": video_path, "audio_path": audio_path}
+                    else:
+                        logger.warning("[APIhut] Downloaded file too small")
+                        return None
+                
+                logger.warning(f"[APIhut] No download URL found in response")
+                return None
+
+            else:
+                # ── Binary video buffer response ──
+                logger.info(f"[APIhut] Binary response: {len(raw_data)} bytes ({len(raw_data) / 1024 / 1024:.1f} MB)")
+                with open(video_path, 'wb') as f:
+                    f.write(raw_data)
+                
+                if os.path.exists(video_path) and os.path.getsize(video_path) > 1000:
+                    logger.info(f"[APIhut] Video saved: {video_path}")
+                    _extract_audio(video_path, audio_path)
+                    return {"video_path": video_path, "audio_path": audio_path}
+                else:
+                    logger.warning("[APIhut] Binary data too small to be a video")
+                    if os.path.exists(video_path):
+                        os.remove(video_path)
+                    return None
+
+    except urllib.error.HTTPError as e:
+        body = e.read().decode('utf-8', errors='ignore')[:500]
+        logger.warning(f"[APIhut] HTTP Error {e.code}: {body}")
+        return None
+    except Exception as e:
+        logger.warning(f"[APIhut] Error: {e}")
+        return None
+
+
+def _extract_audio(video_path: str, audio_path: str):
+    """Extract audio from video using ffmpeg."""
+    if os.path.exists(audio_path):
+        return
+    logger.info(f"Extracting audio: {video_path} → {audio_path}")
+    os.makedirs(os.path.dirname(audio_path), exist_ok=True)
+    subprocess.run([
+        'ffmpeg', '-y', '-i', video_path,
+        '-vn', '-acodec', 'libmp3lame', '-ab', '320k', audio_path
+    ], capture_output=True, timeout=300)
+
+
+# ── yt-dlp fallback (local, uses Chrome cookies) ─────────────────────────
 
 def download_with_ytdlp_fallback(url: str, output_path: str, is_audio: bool = False) -> bool:
-    """Fallback yt-dlp download when Invidious streams are encrypted/DRM'd.
-
-    yt-dlp handles signature decryption and can always extract the file.
-    Uses cookies from Chrome so it works even on restricted videos.
-    """
+    """Fallback yt-dlp download with Chrome cookies for when APIhut is unavailable."""
+    try:
+        import yt_dlp
+    except ImportError:
+        logger.error("yt_dlp not installed — cannot use fallback")
+        return False
+    
     video_fmt = (
         'bestvideo[ext=mp4][height>=2160]+bestaudio[ext=m4a]/'
         'bestvideo[ext=mp4][height>=1440]+bestaudio[ext=m4a]/'
@@ -97,14 +311,16 @@ def download_with_ytdlp_fallback(url: str, output_path: str, is_audio: bool = Fa
         'socket_timeout': 7200,
     }
     try:
-        logger.info(f"yt-dlp fallback download (Chrome cookies)...")
+        logger.info(f"[yt-dlp] Fallback download (Chrome cookies)...")
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             ydl.download([url])
-        return os.path.exists(output_path)
+        return os.path.exists(output_path.replace('%(ext)s', 'mp4'))
     except Exception as e:
-        logger.error(f"yt-dlp fallback also failed: {e}")
+        logger.error(f"[yt-dlp] Fallback also failed: {e}")
         return False
 
+
+# ── Main Agent ────────────────────────────────────────────────────────────
 
 class DownloaderAgent:
     def __init__(self, job_id: str = None):
@@ -116,116 +332,72 @@ class DownloaderAgent:
         logger.info(f"Video Output Directory: {self.video_output_dir}")
         logger.info(f"Audio Output Directory: {self.audio_output_dir}")
 
-    def _extract_video_id(self, url: str) -> str:
-        """Extract YouTube video ID from any YouTube URL format."""
-        # Handle various YouTube URL formats
-        import re
-        patterns = [
-            r'(?:v=|/v/)([a-zA-Z0-9_-]{11})',
-            r'youtu\.be/([a-zA-Z0-9_-]{11})',
-            r'youtube\.com/shorts/([a-zA-Z0-9_-]{11})',
-            r'youtube\.com/embed/([a-zA-Z0-9_-]{11})',
-        ]
-        for pat in patterns:
-            m = re.search(pat, url)
-            if m:
-                return m.group(1)
-        return None
-
     def download(self, url: str):
         logger.info(f"Starting download for URL: {url}")
 
-        video_id = self._extract_video_id(url)
-        if not video_id:
-            logger.error(f"Could not extract video ID from: {url}")
-            return None
+        platform = detect_platform(url)
+        logger.info(f"Detected platform: {platform}")
 
-        # ── Step 1: Try Invidious (no 403s, no auth needed) ───────────────
-        instance = None
-        data = None
-        try:
-            instance = get_invidious_instance()
-            api_url = f"{instance}/api/v1/videos/{video_id}"
-            data = fetch_json(api_url)
-        except Exception as e:
-            logger.warning(f"Invidious failed: {e}")
-
+        video_id = extract_video_id(url) if platform == 'youtube' else None
         title = "Unknown"
-        base_name = f"video [{video_id}]"
+        base_name = f"video_{self.job_id[:8]}"
+
+        if video_id:
+            base_name = f"video [{video_id}]"
+
         video_path = str(self.video_output_dir / f"{base_name}.mp4")
         audio_path = str(self.audio_output_dir / f"{base_name}.mp3")
 
-        if data:
-            title = data.get('title', 'Unknown')
-            safe_title = "".join(c if c.isalnum() or c in ' -_.' else '_' for c in title)
-            base_name = f"{safe_title} [{video_id}]"
-            video_path = str(self.video_output_dir / f"{base_name}.mp4")
-            audio_path = str(self.audio_output_dir / f"{base_name}.mp3")
-
-            adaptive = data.get('adaptiveFormats', []) or []
-
-            # Highest quality MP4 video stream
-            vid_streams = [s for s in adaptive if s.get('type', '').startswith('video/') and s.get('container') == 'mp4']
-            vid_streams.sort(key=lambda s: s.get('height', 0) or 0, reverse=True)
-
-            # Highest quality audio stream
-            audio_streams = [s for s in adaptive if s.get('type', '').startswith('audio/')]
-            audio_streams.sort(key=lambda s: s.get('bitrate', 0) or 0, reverse=True)
-
-            vid_url = vid_streams[0].get('url') if vid_streams else None
-            audio_url = audio_streams[0].get('url') if audio_streams else None
-
-            # If Invidious has direct URLs — use ffmpeg (fast, no re-encode)
-            if audio_url:
-                logger.info(f"Invidious stream available. Downloading audio...")
-                download_ok = download_with_ffmpeg(audio_url, audio_path)
-                if download_ok:
-                    logger.info(f"Audio downloaded: {audio_path}")
-
-            if vid_url:
-                logger.info(f"Invidious video stream available ({vid_streams[0].get('height', '?')}p). Downloading...")
-                download_ok = download_with_ffmpeg(vid_url, video_path)
-                if download_ok:
-                    logger.info(f"Video downloaded: {video_path}")
-                elif not os.path.exists(video_path):
-                    # Invidious gave encrypted/DRM video — use yt-dlp fallback with Chrome cookies
-                    logger.warning("Invidious video stream encrypted. Using yt-dlp Chrome-cookie fallback...")
-                    ok = download_with_ytdlp_fallback(url, str(self.video_output_dir / f"{base_name}.%(ext)s"))
-                    if ok:
-                        # yt-dlp naming: find what it actually saved
-                        files = list(self.video_output_dir.glob(f"{base_name}.*"))
-                        if files:
-                            downloaded = str(files[0])
-                            if not downloaded.endswith('.mp4'):
-                                new_path = downloaded.rsplit('.', 1)[0] + '.mp4'
-                                os.rename(downloaded, new_path)
-                                video_path = new_path
-                            else:
-                                video_path = downloaded
-            elif audio_url:
-                # No video stream, audio only
-                logger.info("No direct video stream — audio only mode")
-        else:
-            # No Invidious available — go straight to yt-dlp with Chrome cookies
-            logger.warning("No Invidious instance available. Using yt-dlp with Chrome cookies...")
+        # ── YouTube: yt-dlp primary (APIhut YouTube is currently broken — 500 errors) ──
+        if platform == 'youtube':
+            logger.info("=" * 60)
+            logger.info("Strategy 1: yt-dlp (primary for YouTube)")
+            logger.info("=" * 60)
             ok = download_with_ytdlp_fallback(url, str(self.video_output_dir / f"{base_name}.%(ext)s"))
             if ok:
                 files = list(self.video_output_dir.glob(f"{base_name}.*"))
                 if files:
                     video_path = str(files[0])
+                    if not video_path.endswith('.mp4'):
+                        new_path = video_path.rsplit('.', 1)[0] + '.mp4'
+                        os.rename(video_path, new_path)
+                        video_path = new_path
+                    logger.info("[yt-dlp] ✓ Download successful!")
+            else:
+                # Try APIhut as fallback for YouTube
+                logger.info("=" * 60)
+                logger.info("Strategy 2: APIhut fallback (for YouTube)")
+                logger.info("=" * 60)
+                result = download_with_apihut(url, platform, video_path, audio_path)
+                if result and (os.path.exists(result.get('video_path', '')) or os.path.exists(result.get('audio_path', ''))):
+                    video_path = result.get('video_path', video_path)
+                    audio_path = result.get('audio_path', audio_path)
+                    logger.info("[APIhut] ✓ Download successful!")
 
-        # ── Verify audio always exists (needed for transcription) ──────
-        if not os.path.exists(audio_path):
-            logger.info("Audio not found — extracting from video with ffmpeg...")
-            if os.path.exists(video_path):
-                subprocess.run([
-                    'ffmpeg', '-y', '-i', video_path,
-                    '-vn', '-acodec', 'libmp3lame', '-ab', '320k', audio_path
-                ], capture_output=True, timeout=300)
+        # ── Other platforms: APIhut primary (Instagram, TikTok, Twitter, etc.) ──
+        else:
+            logger.info("=" * 60)
+            logger.info(f"Strategy 1: APIhut API (primary for {platform})")
+            logger.info("=" * 60)
+            result = download_with_apihut(url, platform, video_path, audio_path)
+            if result and (os.path.exists(result.get('video_path', '')) or os.path.exists(result.get('audio_path', ''))):
+                video_path = result.get('video_path', video_path)
+                audio_path = result.get('audio_path', audio_path)
+                logger.info("[APIhut] ✓ Download successful!")
+            else:
+                logger.warning(f"[APIhut] Failed for {platform}. No additional fallback available.")
+
+        # ── Ensure audio always exists (needed for transcription) ─────────
+        if not os.path.exists(audio_path) and os.path.exists(video_path):
+            _extract_audio(video_path, audio_path)
 
         if not os.path.exists(video_path) and not os.path.exists(audio_path):
             logger.error("Neither video nor audio was downloaded")
             return None
+
+        # Try to get a better title from the video ID
+        if video_id and title == "Unknown":
+            base_name = f"video [{video_id}]"
 
         # ── Write manifest ────────────────────────────────────────────────
         os.makedirs(self.manifest_output_dir, exist_ok=True)
@@ -235,6 +407,7 @@ class DownloaderAgent:
             "audio_path": audio_path if os.path.exists(audio_path) else "",
             "base_name": base_name,
             "title": title,
+            "platform": platform,
         }
         manifest_path = os.path.join(self.manifest_output_dir, f"{self.job_id}_manifest.json")
         with open(manifest_path, 'w') as f:
@@ -249,7 +422,7 @@ class DownloaderAgent:
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Downloader Agent for fetching Video and Audio via Invidious")
+    parser = argparse.ArgumentParser(description="Downloader Agent — APIhut primary + yt-dlp fallback")
     parser.add_argument("url", help="The URL of the video to download")
     parser.add_argument("--job-id", help="Job ID for manifest naming", default="unknown")
     args = parser.parse_args()

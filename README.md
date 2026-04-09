@@ -9,7 +9,11 @@ This is a production-level multi-agent architecture designed to process, transcr
 - `output/` - The unified sink for all agent outputs. Automatically generated.
 
 ## Downloader Agent
-The Downloader agent can extract high-quality video and isolated audio from YouTube, Twitter, TikTok, and thousands of other video hosting websites using `yt-dlp` and `ffmpeg`.
+The Downloader agent uses a platform-aware dual strategy:
+- **YouTube**: `yt-dlp` (primary) with Chrome cookies → APIhut API (fallback)
+- **Instagram, TikTok, Twitter, LinkedIn, Facebook**: APIhut API (primary)
+
+Audio is automatically extracted via `ffmpeg`.
 
 ### Usage
 ```bash
