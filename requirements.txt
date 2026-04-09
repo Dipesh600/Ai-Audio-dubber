@@ -1,0 +1,17 @@
+# Python dependencies for AI dubbing agents
+# Install: pip install -r requirements.txt
+
+# Audio processing
+pydub>=0.25.1
+
+# Environment variables
+python-dotenv>=1.0.0
+
+# Transcription (Groq Whisper)
+groq>=0.4.0
+
+# Translation & AI (Gemini)
+google-genai>=1.0.0
+
+# YouTube downloads (fallback — requires Chrome on same machine)
+yt-dlp>=2024.0.0

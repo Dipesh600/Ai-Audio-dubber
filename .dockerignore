@@ -1,0 +1,23 @@
+# Ignore files not needed in the Docker image
+node_modules/
+.next/
+out/
+.env
+.env.local
+.env.*.local
+*.sqlite
+*.sqlite3
+.DS_Store
+.git/
+.gitignore
+.claude/
+.gemini/
+README.md
+*.md
+
+# Don't include output from local runs
+output/
+uploads_tmp/
+
+# Frontend (deployed separately on Vercel)
+orchestrator/frontend/

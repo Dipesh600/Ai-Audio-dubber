@@ -1,8 +1,9 @@
 import os
 from pathlib import Path
 
-# The absolute path to the root directory "my audio dubber"
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
+# PROJECT_ROOT: prefer env var (Docker/Railway), fallback to file-based resolution
+_env_root = os.environ.get("PROJECT_ROOT")
+PROJECT_ROOT = Path(_env_root) if _env_root else Path(__file__).resolve().parent.parent
 
 # The global output directory
 OUTPUT_DIR = PROJECT_ROOT / "output"

@@ -1,8 +1,10 @@
 import sqlite3 from 'sqlite3';
 import path from 'path';
+import { PROJECT_ROOT } from './agentRunner';
 
-const DB_PATH = path.join(__dirname, '../jobs.sqlite');
+const DB_PATH = path.join(PROJECT_ROOT, 'jobs.sqlite');
 export const db = new sqlite3.Database(DB_PATH);
+console.log(`[DB] SQLite path: ${DB_PATH}`);
 
 // ── Schema ──
 db.serialize(() => {
