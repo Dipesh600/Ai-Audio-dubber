@@ -152,17 +152,34 @@ export async function runAlignment(jobId: string, baseName: string, targetPath: 
     const dubbedPath = path.join(dubbedDir, `${langStem}_Dubbed.mp4`);
     const outputPath = fs.existsSync(dubbedPath) ? dubbedPath : '';
 
-    const outRow = await dbGet(`SELECT output_paths FROM jobs WHERE id=?`, [jobId]);
+    const outRow = await dbGet(`SELECT output_paths, azure_urls FROM jobs WHERE id=?`, [jobId]);
     let outputPaths: Record<string, string> = {};
+    let azureUrls: Record<string, string> = {};
     try { outputPaths = JSON.parse(outRow?.output_paths || '{}'); } catch {}
+    try { azureUrls = JSON.parse(outRow?.azure_urls || '{}'); } catch {}
     if (outputPath) outputPaths[lang] = outputPath;
+
+    // Upload dubbed video to Azure Blob Storage (non-blocking — pipeline continues even if Azure fails)
+    if (outputPath) {
+      try {
+        const { uploadToAzure } = await import('./services/azureStorage');
+        const azureUrl = await uploadToAzure(outputPath, `jobs/${jobId}/dubbed_${lang}.mp4`);
+        if (azureUrl) {
+          azureUrls[lang] = azureUrl;
+          console.log(`[PIPELINE] Azure upload complete for ${lang}: ${azureUrl}`);
+        }
+      } catch (e: any) {
+        console.warn(`[PIPELINE] Azure upload skipped: ${e.message}`);
+      }
+    }
 
     setJobFields(jobId, {
       status: 'REVIEW',
       output_path: outputPath,
       output_paths: JSON.stringify(outputPaths),
+      azure_urls: JSON.stringify(azureUrls),
     });
-    emitJobUpdate(jobId, { status: 'REVIEW', output_path: outputPath, output_paths: outputPaths });
+    emitJobUpdate(jobId, { status: 'REVIEW', output_path: outputPath, output_paths: outputPaths, azure_urls: azureUrls });
   } catch (e: any) {
     setJobFields(jobId, { status: 'ERROR', error: e.message });
     emitJobUpdate(jobId, { status: 'ERROR', error: e.message });

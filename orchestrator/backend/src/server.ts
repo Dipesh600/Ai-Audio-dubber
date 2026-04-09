@@ -35,7 +35,14 @@ app.use('/api', uploadRoutes);
 app.use('/api', libraryRoutes);
 
 // ── Health Check ──
-app.get('/api/health', (_req, res) => res.json({ status: 'ok', ws: true }));
+app.get('/api/health', async (_req, res) => {
+  let azureOk = false;
+  try {
+    const { isAzureAvailable } = await import('./services/azureStorage');
+    azureOk = await isAzureAvailable();
+  } catch {}
+  res.json({ status: 'ok', ws: true, azure: azureOk });
+});
 
 // ── Error Handler ──
 app.use(errorHandler);

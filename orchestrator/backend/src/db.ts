@@ -23,13 +23,15 @@ db.serialize(() => {
     output_path    TEXT DEFAULT '',
     output_paths   TEXT DEFAULT '{}',
     final_paths    TEXT DEFAULT '{}',
+    azure_urls     TEXT DEFAULT '{}',
     bgm_path       TEXT DEFAULT '',
     error          TEXT DEFAULT '',
     created_at     DATETIME DEFAULT CURRENT_TIMESTAMP
   )`);
   const migrate = [
     'title', 'video_size_mb', 'audio_size_mb', 'nepali_preview', 'eng_preview',
-    'output_path', 'output_paths', 'final_paths', 'lang_previews', 'languages', 'bgm_path'
+    'output_path', 'output_paths', 'final_paths', 'lang_previews', 'languages', 'bgm_path',
+    'azure_urls'
   ];
   migrate.forEach(col => db.run(`ALTER TABLE jobs ADD COLUMN ${col} TEXT DEFAULT ''`, () => {}));
 });
@@ -53,7 +55,7 @@ export function parseJobRow(row: any) {
   (['eng_preview', 'nepali_preview'] as const).forEach(k => {
     try { row[k] = JSON.parse(row[k] || '[]'); } catch { row[k] = []; }
   });
-  (['lang_previews', 'output_paths', 'final_paths'] as const).forEach(k => {
+  (['lang_previews', 'output_paths', 'final_paths', 'azure_urls'] as const).forEach(k => {
     try { row[k] = JSON.parse(row[k] || '{}'); } catch { row[k] = {}; }
   });
   return row;

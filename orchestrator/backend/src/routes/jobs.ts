@@ -44,8 +44,10 @@ router.post('/approve/:id', async (req, res) => {
 
     let outputPaths: Record<string, string> = {};
     let finalPaths:  Record<string, string> = {};
+    let azureUrls:   Record<string, string> = {};
     try { outputPaths = JSON.parse(row.output_paths || '{}'); } catch {}
     try { finalPaths  = JSON.parse(row.final_paths  || '{}'); } catch {}
+    try { azureUrls   = JSON.parse(row.azure_urls   || '{}'); } catch {}
 
     const finalsDir = path.join(PROJECT_ROOT, 'output', 'finals');
     if (!fs.existsSync(finalsDir)) fs.mkdirSync(finalsDir, { recursive: true });
@@ -56,6 +58,18 @@ router.post('/approve/:id', async (req, res) => {
         const dest = path.join(finalsDir, destFile);
         fs.copyFileSync(srcPath, dest);
         finalPaths[lang] = dest;
+
+        // Upload final to Azure
+        try {
+          const { uploadToAzure } = await import('../services/azureStorage');
+          const azureUrl = await uploadToAzure(dest, `finals/${jobId}/${destFile}`);
+          if (azureUrl) {
+            azureUrls[`final_${lang}`] = azureUrl;
+            console.log(`[APPROVE] Azure upload: ${destFile} → ${azureUrl}`);
+          }
+        } catch (e: any) {
+          console.warn(`[APPROVE] Azure upload skipped: ${e.message}`);
+        }
       }
     }
 
@@ -68,6 +82,7 @@ router.post('/approve/:id', async (req, res) => {
       final_paths: JSON.stringify(finalPaths),
       output_paths: JSON.stringify({}),
       output_path: finalPaths[allLangs[0]] || row.output_path,
+      azure_urls: JSON.stringify(azureUrls),
     });
 
     if (allFinalized) deleteIntermediates(row.base_name, row.id);
