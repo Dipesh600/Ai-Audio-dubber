@@ -2,14 +2,16 @@
  * Azure Blob Storage service for Setu Dubber.
  * 
  * Handles uploading/downloading video and audio files to Azure Blob Storage
- * so they persist across Railway container redeploys.
+ * so they persist across container redeploys (Render/Railway).
+ * 
+ * Uses PRIVATE containers with SAS token URLs — no public access needed.
  * 
  * Required env vars:
  *   AZURE_STORAGE_CONNECTION_STRING  — from Azure Portal → Storage Account → Access Keys
  *   AZURE_STORAGE_CONTAINER          — container name (default: "setu-dubber")
  */
 
-import { BlobServiceClient, ContainerClient, StorageSharedKeyCredential } from '@azure/storage-blob';
+import { BlobServiceClient, ContainerClient, BlobSASPermissions, generateBlobSASQueryParameters, StorageSharedKeyCredential } from '@azure/storage-blob';
 import fs from 'fs';
 import path from 'path';
 
@@ -18,6 +20,45 @@ const connectionString = process.env.AZURE_STORAGE_CONNECTION_STRING || '';
 const containerName = process.env.AZURE_STORAGE_CONTAINER || 'setu-dubber';
 
 let containerClient: ContainerClient | null = null;
+let sharedKeyCredential: StorageSharedKeyCredential | null = null;
+
+// Extract account name and key from connection string for SAS token generation
+function getCredential(): StorageSharedKeyCredential | null {
+  if (sharedKeyCredential) return sharedKeyCredential;
+  if (!connectionString) return null;
+  try {
+    const accountName = connectionString.match(/AccountName=([^;]+)/)?.[1] || '';
+    const accountKey = connectionString.match(/AccountKey=([^;]+)/)?.[1] || '';
+    if (accountName && accountKey) {
+      sharedKeyCredential = new StorageSharedKeyCredential(accountName, accountKey);
+      return sharedKeyCredential;
+    }
+  } catch {}
+  return null;
+}
+
+/**
+ * Generate a SAS token URL for a blob (valid for 30 days).
+ * This allows reading the blob without public container access.
+ */
+async function generateSasUrl(blobName: string): Promise<string | null> {
+  const container = await getContainer();
+  const credential = getCredential();
+  if (!container || !credential) return null;
+
+  const blobClient = container.getBlobClient(blobName);
+  const expiresOn = new Date();
+  expiresOn.setDate(expiresOn.getDate() + 30); // 30 days
+
+  const sasToken = generateBlobSASQueryParameters({
+    containerName,
+    blobName,
+    permissions: BlobSASPermissions.parse('r'), // read-only
+    expiresOn,
+  }, credential).toString();
+
+  return `${blobClient.url}?${sasToken}`;
+}
 
 /**
  * Initialize the Azure Blob container client.
@@ -34,9 +75,9 @@ async function getContainer(): Promise<ContainerClient | null> {
     const blobServiceClient = BlobServiceClient.fromConnectionString(connectionString);
     containerClient = blobServiceClient.getContainerClient(containerName);
     
-    // Create container if it doesn't exist (public read access for blobs)
-    await containerClient.createIfNotExists({ access: 'blob' });
-    console.log(`[AZURE] Connected to container: "${containerName}"`);
+    // Create PRIVATE container (no public access required)
+    await containerClient.createIfNotExists();
+    console.log(`[AZURE] Connected to container: "${containerName}" (private)`);
     return containerClient;
   } catch (err: any) {
     console.error(`[AZURE] Failed to connect: ${err.message}`);
@@ -77,8 +118,9 @@ export async function uploadToAzure(localPath: string, blobName: string): Promis
       blobHTTPHeaders: { blobContentType: contentType },
     });
 
-    const url = blockBlobClient.url;
-    console.log(`[AZURE] ✓ Uploaded: ${url}`);
+    // Generate SAS token URL (valid for 7 days) — no public access needed
+    const url = await generateSasUrl(blobName);
+    console.log(`[AZURE] ✓ Uploaded with SAS URL`);
     return url;
   } catch (err: any) {
     console.error(`[AZURE] Upload failed for ${blobName}: ${err.message}`);

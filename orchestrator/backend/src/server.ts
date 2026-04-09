@@ -1,3 +1,9 @@
+import dotenv from 'dotenv';
+import path from 'path';
+
+// Load .env from project root (must be before any other imports that use env vars)
+dotenv.config({ path: path.resolve(__dirname, '../../../.env') });
+
 import express from 'express';
 import cors from 'cors';
 import { createServer } from 'http';
