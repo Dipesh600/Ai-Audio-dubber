@@ -2,7 +2,7 @@ FROM node:20-slim
 
 # ── System dependencies ──
 RUN apt-get update && apt-get install -y \
-    python3 python3-pip python3-venv ffmpeg curl \
+    python3 python3-pip python3-venv ffmpeg curl build-essential \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
@@ -14,6 +14,7 @@ RUN pip3 install --no-cache-dir --break-system-packages -r requirements.txt
 # ── Node.js dependencies (backend only) ──
 COPY orchestrator/backend/package*.json ./orchestrator/backend/
 RUN cd orchestrator/backend && npm ci
+RUN cd orchestrator/backend && npm rebuild sqlite3 --build-from-source
 
 # ── Copy source code ──
 # Agents + shared core (Python)
