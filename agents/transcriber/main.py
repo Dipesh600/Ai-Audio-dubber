@@ -324,9 +324,6 @@ Segments to fix:
             logger.info(f"[Timing Inspector] Finished {lang_title} after {pass_num} pass(es).")
             return script
 
-    except Exception as e:
-        logger.error(f"Timing Inspector Gemini error: {e}")
-        return script
 
 
 class TranscriberAgent:
