@@ -141,18 +141,25 @@ def translate_and_emotion(json_data: dict, target_lang: str = 'Nepali') -> dict:
         for s in segments
     ]
     
-    try:
-        response = client.models.generate_content(
-            model='gemini-2.5-flash',
-            contents=prompt + json.dumps(condensed_segments, indent=2),
-            config=types.GenerateContentConfig(
-                response_mime_type="application/json"
+    import time
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            response = client.models.generate_content(
+                model='gemini-2.5-flash',
+                contents=prompt + json.dumps(condensed_segments, indent=2),
+                config=types.GenerateContentConfig(
+                    response_mime_type="application/json"
+                )
             )
-        )
-        return json.loads(response.text)
-    except Exception as e:
-        logger.error(f"Gemini API failure: {e}")
-        return None
+            return json.loads(response.text)
+        except Exception as e:
+            if attempt < max_retries - 1:
+                logger.warning(f"Gemini API failure (attempt {attempt + 1}/{max_retries}): {e}. Retrying in 5 seconds...")
+                time.sleep(5)
+            else:
+                logger.error(f"Gemini API failure after {max_retries} attempts: {e}")
+                return None
 
 def estimate_tts_duration(text: str, target_lang: str = 'nepali') -> float:
     """Estimate how long TTS will speak the text, using per-language speaking rate."""
@@ -265,16 +272,29 @@ Output format:
 
 Segments to fix:
 """
-    try:
-        response = client.models.generate_content(
-            model='gemini-2.5-flash',
-            contents=INSPECTOR_PROMPT + json.dumps(issues, ensure_ascii=False, indent=2),
-            config=types.GenerateContentConfig(response_mime_type="application/json")
-        )
-        corrections = json.loads(response.text)
-        if not isinstance(corrections, list):
-            logger.warning("Timing Inspector: Gemini returned unexpected format, skipping corrections.")
-            return script
+    import time
+    max_retries = 3
+    corrections = None
+    for attempt in range(max_retries):
+        try:
+            response = client.models.generate_content(
+                model='gemini-2.5-flash',
+                contents=INSPECTOR_PROMPT + json.dumps(issues, ensure_ascii=False, indent=2),
+                config=types.GenerateContentConfig(response_mime_type="application/json")
+            )
+            corrections = json.loads(response.text)
+            break
+        except Exception as e:
+            if attempt < max_retries - 1:
+                logger.warning(f"Timing Inspector Gemini error (attempt {attempt + 1}/{max_retries}): {e}. Retrying in 5 seconds...")
+                time.sleep(5)
+            else:
+                logger.error(f"Timing Inspector Gemini error after {max_retries} attempts: {e}")
+                return script
+                
+    if not isinstance(corrections, list):
+        logger.warning("Timing Inspector: Gemini returned unexpected format, skipping corrections.")
+        return script
 
         # Apply corrections and log diff
         corrections_map = {c.get('id'): c for c in corrections if isinstance(c, dict)}
