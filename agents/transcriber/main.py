@@ -145,8 +145,9 @@ def translate_and_emotion(json_data: dict, target_lang: str = 'Nepali') -> dict:
     max_retries = 3
     for attempt in range(max_retries):
         try:
+            model_name = 'gemini-2.5-flash' if attempt == 0 else 'gemini-1.5-flash'
             response = client.models.generate_content(
-                model='gemini-2.5-flash',
+                model=model_name,
                 contents=prompt + json.dumps(condensed_segments, indent=2),
                 config=types.GenerateContentConfig(
                     response_mime_type="application/json"
@@ -155,7 +156,7 @@ def translate_and_emotion(json_data: dict, target_lang: str = 'Nepali') -> dict:
             return json.loads(response.text)
         except Exception as e:
             if attempt < max_retries - 1:
-                logger.warning(f"Gemini API failure (attempt {attempt + 1}/{max_retries}): {e}. Retrying in 5 seconds...")
+                logger.warning(f"Gemini API failure (attempt {attempt + 1}/{max_retries}): {e}. Retrying with { 'gemini-1.5-flash' } in 5 seconds...")
                 time.sleep(5)
             else:
                 logger.error(f"Gemini API failure after {max_retries} attempts: {e}")
@@ -277,8 +278,9 @@ Segments to fix:
     corrections = None
     for attempt in range(max_retries):
         try:
+            model_name = 'gemini-2.5-flash' if attempt == 0 else 'gemini-1.5-flash'
             response = client.models.generate_content(
-                model='gemini-2.5-flash',
+                model=model_name,
                 contents=INSPECTOR_PROMPT + json.dumps(issues, ensure_ascii=False, indent=2),
                 config=types.GenerateContentConfig(response_mime_type="application/json")
             )
@@ -286,7 +288,7 @@ Segments to fix:
             break
         except Exception as e:
             if attempt < max_retries - 1:
-                logger.warning(f"Timing Inspector Gemini error (attempt {attempt + 1}/{max_retries}): {e}. Retrying in 5 seconds...")
+                logger.warning(f"Timing Inspector Gemini error (attempt {attempt + 1}/{max_retries}): {e}. Retrying with { 'gemini-1.5-flash' } in 5 seconds...")
                 time.sleep(5)
             else:
                 logger.error(f"Timing Inspector Gemini error after {max_retries} attempts: {e}")
