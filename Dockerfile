@@ -13,7 +13,7 @@ RUN pip3 install --no-cache-dir --break-system-packages -r requirements.txt
 
 # ── Node.js dependencies (backend only) ──
 COPY orchestrator/backend/package*.json ./orchestrator/backend/
-RUN cd orchestrator/backend && npm ci --omit=dev
+RUN cd orchestrator/backend && npm ci
 
 # ── Copy source code ──
 # Agents + shared core (Python)
@@ -24,6 +24,10 @@ COPY .env.example ./.env.example
 # Backend (Node.js)
 COPY orchestrator/backend/src/ ./orchestrator/backend/src/
 COPY orchestrator/backend/tsconfig.json ./orchestrator/backend/
+
+# ── Build TS & Prune Dev Dependencies ──
+RUN cd orchestrator/backend && npm run build
+RUN cd orchestrator/backend && npm prune --omit=dev
 
 # ── Create required directories ──
 RUN mkdir -p output/downloader/videos output/downloader/audio output/downloader/manifests \
