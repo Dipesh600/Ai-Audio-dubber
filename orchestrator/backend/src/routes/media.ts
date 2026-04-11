@@ -14,11 +14,7 @@ router.get('/media', async (req, res) => {
     const row = await dbGet(`SELECT * FROM jobs WHERE id=?`, [id]);
     if (!row) return res.status(404).json({ error: 'Job not found.' });
 
-    // Try local file first
-    const filePath = resolveMediaPath(type, row, lang);
-    if (filePath && fs.existsSync(filePath)) return res.sendFile(filePath);
-
-    // Fall back to Azure URLs
+    // Try Azure URLs first
     let azureUrls: Record<string, string> = {};
     try { azureUrls = typeof row.azure_urls === 'string' ? JSON.parse(row.azure_urls || '{}') : (row.azure_urls || {}); } catch {}
 
@@ -31,6 +27,10 @@ router.get('/media', async (req, res) => {
     if (azureKey && azureUrls[azureKey]) {
       return res.redirect(azureUrls[azureKey]);
     }
+
+    // Fall back to local file
+    const filePath = resolveMediaPath(type, row, lang);
+    if (filePath && fs.existsSync(filePath)) return res.sendFile(filePath);
 
     return res.status(404).json({ error: 'File not found (local or Azure).' });
   } catch (e: any) {
@@ -46,21 +46,21 @@ router.get('/final', async (req, res) => {
     const row = await dbGet(`SELECT * FROM jobs WHERE id=?`, [id]);
     if (!row) return res.status(404).end();
 
-    // Try local file
-    if (row.output_path && fs.existsSync(row.output_path)) return res.sendFile(row.output_path);
+    // Try Azure URLs first
+    let azureUrls: Record<string, string> = {};
+    try { azureUrls = typeof row.azure_urls === 'string' ? JSON.parse(row.azure_urls || '{}') : (row.azure_urls || {}); } catch {}
+    const azureKey = lang ? `final_${lang}` : Object.keys(azureUrls).find(k => k.startsWith('final_'));
+    if (azureKey && azureUrls[azureKey]) return res.redirect(azureUrls[azureKey]);
 
-    // Try final_paths
+    // Fall back to local final_paths
     let finalPaths: Record<string, string> = {};
     try { finalPaths = typeof row.final_paths === 'string' ? JSON.parse(row.final_paths || '{}') : (row.final_paths || {}); } catch {}
     if (lang && finalPaths[lang] && fs.existsSync(finalPaths[lang])) return res.sendFile(finalPaths[lang]);
     const anyFinal = Object.values(finalPaths).find(p => fs.existsSync(p as string));
     if (anyFinal) return res.sendFile(anyFinal as string);
 
-    // Fall back to Azure
-    let azureUrls: Record<string, string> = {};
-    try { azureUrls = typeof row.azure_urls === 'string' ? JSON.parse(row.azure_urls || '{}') : (row.azure_urls || {}); } catch {}
-    const azureKey = lang ? `final_${lang}` : Object.keys(azureUrls).find(k => k.startsWith('final_'));
-    if (azureKey && azureUrls[azureKey]) return res.redirect(azureUrls[azureKey]);
+    // Fall back to output_path backwards compatibility
+    if (row.output_path && fs.existsSync(row.output_path)) return res.sendFile(row.output_path);
 
     return res.status(404).end();
   } catch (e: any) {
