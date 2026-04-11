@@ -16,3 +16,4 @@ google-genai>=1.0.0
 # YouTube downloads (fallback — requires Chrome on same machine)
 yt-dlp>=2024.0.0
 openai>=1.0.0
+ffmpeg-python>=0.2.0
