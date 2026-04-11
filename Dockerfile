@@ -34,7 +34,7 @@ RUN cd orchestrator/backend && npm prune --omit=dev
 RUN mkdir -p output/downloader/videos output/downloader/audio output/downloader/manifests \
     output/transcriber/original_voiceover_transcription output/transcriber/generated_voiceover_script \
     output/aligner/aligned_audio output/aligner/dubbed_video \
-    output/finals output/input/audio uploads_tmp
+    output/finals input/audio input/video uploads_tmp
 
 # ── Environment ──
 ENV NODE_ENV=production
