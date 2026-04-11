@@ -15,6 +15,141 @@ from core.logger import get_logger
 
 logger = get_logger("TranscriberAgent")
 
+# ── JSON response cleaner ──
+def _clean_json_response(raw: str) -> str:
+    """Strip markdown fences, reasoning tags, and whitespace from LLM output to get clean JSON."""
+    if not raw:
+        raise ValueError("LLM returned empty response")
+    text = raw.strip()
+    
+    # Strip <think>...</think> reasoning blocks (MiniMax M1, DeepSeek, etc.)
+    import re
+    text = re.sub(r'<think>.*?</think>', '', text, flags=re.DOTALL).strip()
+    
+    # Remove ```json ... ``` or ``` ... ``` fencing
+    if text.startswith('```'):
+        first_newline = text.find('\n')
+        if first_newline != -1:
+            text = text[first_newline + 1:]
+        if text.rstrip().endswith('```'):
+            text = text.rstrip()[:-3].rstrip()
+    
+    # If still not starting with { or [, try to find the first JSON object/array
+    if text and text[0] not in ('{', '['):
+        # Find first { or [
+        brace = text.find('{')
+        bracket = text.find('[')
+        starts = [i for i in [brace, bracket] if i >= 0]
+        if starts:
+            text = text[min(starts):]
+    
+    if not text:
+        raise ValueError("LLM response contained no JSON after cleaning")
+    
+    # Validate it's parseable JSON
+    json.loads(text)
+    return text
+
+
+# ── Shared LLM caller with MiniMax primary + Gemini fallback ──
+def _call_llm(prompt: str, json_mode: bool = True) -> str:
+    """
+    Call an LLM with automatic provider fallback.
+    Strategy: MiniMax (paid, reliable) → Gemini 2.5 Flash (free tier).
+    Retries up to 5 times total with 10s between attempts.
+    Returns the raw response text (should be JSON if json_mode=True).
+    """
+    import time
+
+    minimax_key = os.environ.get('MINIMAX_API_KEY', '')
+    gemini_key  = os.environ.get('GEMINI_API_KEY', '')
+
+    # Build ordered list of providers to try
+    providers = []
+    if minimax_key:
+        providers.append(('minimax', minimax_key))
+    if gemini_key:
+        providers.append(('gemini', gemini_key))
+    if not providers:
+        raise RuntimeError("No LLM API key found. Set MINIMAX_API_KEY or GEMINI_API_KEY in .env")
+
+    max_retries = 5
+    last_error = None
+
+    for attempt in range(max_retries):
+        # Cycle through providers: primary first, then fallback
+        provider_name, api_key = providers[attempt % len(providers)] if len(providers) > 1 and attempt >= 2 else providers[0]
+        # After 2 failures on primary, start alternating to fallback
+        if attempt >= 2 and len(providers) > 1:
+            provider_name, api_key = providers[attempt % len(providers)]
+
+        try:
+            if provider_name == 'minimax':
+                result = _call_minimax(prompt, api_key, json_mode)
+            else:
+                result = _call_gemini(prompt, api_key, json_mode)
+            # Clean and validate JSON before returning
+            if json_mode:
+                result = _clean_json_response(result)
+            logger.info(f"LLM call succeeded via {provider_name} (attempt {attempt + 1})")
+            return result
+        except Exception as e:
+            last_error = e
+            if attempt < max_retries - 1:
+                logger.warning(f"LLM failure ({provider_name}, attempt {attempt + 1}/{max_retries}): {e}. Retrying in 10s...")
+                time.sleep(10)
+            else:
+                logger.error(f"LLM failure after {max_retries} attempts: {e}")
+                raise
+
+
+def _call_minimax(prompt: str, api_key: str, json_mode: bool) -> str:
+    """Call MiniMax via OpenAI-compatible endpoint."""
+    from openai import OpenAI
+
+    client = OpenAI(api_key=api_key, base_url="https://api.minimax.io/v1")
+    messages = [
+        {"role": "system", "content": "You are an expert multilingual dubbing script editor. You MUST respond with valid JSON only. No markdown fencing, no explanation, no extra text — just the raw JSON object."},
+        {"role": "user", "content": prompt}
+    ]
+    kwargs = {
+        "model": "MiniMax-M2.7",
+        "messages": messages,
+        "temperature": 0.7,
+        "max_tokens": 8192,
+    }
+    # Use native JSON mode if supported
+    if json_mode:
+        kwargs["response_format"] = {"type": "json_object"}
+    
+    response = client.chat.completions.create(**kwargs)
+    
+    # Debug: log what we actually got back
+    content = response.choices[0].message.content if response.choices else None
+    logger.info(f"[MiniMax] model=MiniMax-M2.7, finish_reason={response.choices[0].finish_reason if response.choices else 'N/A'}, content_length={len(content) if content else 0}")
+    
+    if not content or not content.strip():
+        raise ValueError(f"MiniMax returned empty content. finish_reason={response.choices[0].finish_reason if response.choices else 'unknown'}")
+    
+    return content
+
+
+def _call_gemini(prompt: str, api_key: str, json_mode: bool) -> str:
+    """Call Gemini via google-genai SDK."""
+    from google import genai
+    from google.genai import types
+
+    client = genai.Client(api_key=api_key)
+    config = types.GenerateContentConfig(
+        response_mime_type="application/json"
+    ) if json_mode else None
+    response = client.models.generate_content(
+        model='gemini-2.5-flash',
+        contents=prompt,
+        config=config
+    )
+    return response.text
+
 def run_groq_whisper(audio_path: str, language: str = None) -> dict:
     from groq import Groq
     
@@ -89,46 +224,81 @@ MAX_INSPECT_PASSES = 2     # Max correction rounds
 # ──────────────────────────────────────────────────────
 
 def translate_and_emotion(json_data: dict, target_lang: str = 'Nepali') -> dict:
-    from google import genai
-    from google.genai import types
-
-    # Initialize Gemini client using GEMINI_API_KEY from environment
-    try:
-        client = genai.Client()
-    except Exception as e:
-        logger.error(f"Could not initialize Gemini Client: {e}")
-        return None
-    
     lang_title = target_lang.title()
+    
+    # Build script for the target language
+    if lang_title in ('Hindi', 'Nepali'):
+        script_name = 'देवनागरी (Devanagari)'
+    else:
+        script_name = lang_title
+    
     prompt = f"""
-    You are an expert Audio Dubbing Script Editor, YouTube Storyteller, and Emotional Analyst.
-    
-    I will provide a JSON containing precise timestamps and transcriptions of segments from Groq Whisper.
-    Your task:
-    1. For each segment, determine the emotion expressed in the text.
-    2. Translate the text into a professional {lang_title} voiceover script that closely matches the timing length of the original text (`translated_text`).
-    3. Generate a highly engaging, natural-sounding adaptation of that same text in {lang_title} tailored specifically for YouTube storytelling, without restricting yourself to the strict timing (`natural_translated_text`).
-    
-    IMPORTANT: The target language is {lang_title}. ALL translated_text and natural_translated_text fields MUST be written in {lang_title} only.
-    
-    Output a single valid JSON object containing two main keys:
-    1. `segments`: A JSON array of objects, each containing:
-       - `id`: the segment ID
-       - `start`: start time (as provided)
-       - `end`: end time (as provided)
-       - `original_text`: the original transcribed string
-       - `emotion`: the designated emotion tag (e.g., Happy, Serious, Angry, Neutral, Excited, Sad)
-       - `translated_text`: the timing-matched translated text in {lang_title}
-       - `natural_translated_text`: the engaging, natural-flowing {lang_title} adaptation for YouTube
-    2. `full_natural_script`: A single string containing the entire `natural_translated_text` concatenated together in paragraph form.
-    
-    Here is the input:
-    """
+You are a professional SCREENWRITER and DIALOGUE WRITER for dubbed video content.
+You are writing a voiceover narration script for a video being dubbed from English to {lang_title}.
+
+ROLE: You are NOT a translator. You are a scriptwriter who understands visual storytelling.
+Think about what the viewer is SEEING on screen and write narration that complements the visuals.
+
+INPUT: I will provide JSON segments with timestamps and English transcription from the original video.
+
+YOUR TASK for each segment:
+1. Determine the emotion (Happy, Serious, Angry, Neutral, Excited, Sad, Curious, Dramatic)
+2. Write `translated_text`: A timing-matched {lang_title} voiceover script in {script_name} script
+3. Write `natural_translated_text`: A more dynamic, engaging version (can be slightly longer/shorter)
+
+═══════════════════════════════════════════════════════
+ABSOLUTE RULES — VIOLATION OF ANY RULE IS UNACCEPTABLE
+═══════════════════════════════════════════════════════
+
+RULE 1 — SCRIPT & LANGUAGE:
+  • ALL output text MUST be in {script_name} script. ZERO Romanized text.
+  • Hindi example: "अगर आपको कांटा चुभ जाए" ✓   "Agar aapko kaanta chubh jaye" ✗
+  • Nepali example: "यदि तपाईंलाई काँडा लाग्यो भने" ✓   "Yadi tapailai kaanda lagyo bhane" ✗
+
+RULE 2 — VOCABULARY & TRANSLATION:
+  • Translate ALL English words into proper {lang_title}. Do NOT keep English words as-is.
+  • "splinter" → Hindi: "किरचा" or "काँटा", Nepali: "काँडा" or "किरचा"
+  • "deep" → "गहराई में" / "गहिरो"
+  • "infection" → "संक्रमण" / "सङ्क्रमण"  
+  • "surface" → "सतह" / "सतह"
+  • "pressure" → "दबाव" / "दबाब"
+  • "pus" → "मवाद" / "पिप"
+  • ONLY keep English words that have genuinely NO equivalent (brand names, technical jargon with no native word)
+
+RULE 3 — TONE & REGISTER:
+  • Write like a professional VIDEO NARRATOR, not a friend chatting.
+  • NO casual fillers: "yaar", "bro", "guys", "na", "toh basically"
+  • Think Discovery Channel Hindi / Nepali narrator tone — clear, engaging, authoritative
+  • The narration should make the viewer feel they're watching premium dubbed content
+
+RULE 4 — VISUAL CONTEXT AWARENESS:
+  • Remember: this is a VIDEO. The viewer is watching something on screen.
+  • Write narration that complements what the viewer sees, don't just translate words.
+  • Make the viewer curious about what's happening visually.
+
+OUTPUT FORMAT — Return a single JSON object:
+{{
+  "segments": [
+    {{
+      "id": <int>,
+      "start": <float>,
+      "end": <float>,
+      "original_text": "<original English>",
+      "emotion": "<emotion tag>",
+      "translated_text": "<timing-matched {script_name} script>",
+      "natural_translated_text": "<engaging {script_name} adaptation>"
+    }}
+  ],
+  "full_natural_script": "<all natural_translated_text joined as paragraph>"
+}}
+
+Here is the input:
+"""
     
     segments = json_data.get("segments", [])
     if not segments:
         logger.warning("No segments found in the transcript.")
-        return []
+        return {"segments": [], "full_natural_script": ""}
     
     # Send only necessary info to save tokens
     condensed_segments = [
@@ -141,25 +311,17 @@ def translate_and_emotion(json_data: dict, target_lang: str = 'Nepali') -> dict:
         for s in segments
     ]
     
-    import time
-    max_retries = 3
-    for attempt in range(max_retries):
-        try:
-            response = client.models.generate_content(
-                model='gemini-2.5-flash',
-                contents=prompt + json.dumps(condensed_segments, indent=2),
-                config=types.GenerateContentConfig(
-                    response_mime_type="application/json"
-                )
-            )
-            return json.loads(response.text)
-        except Exception as e:
-            if attempt < max_retries - 1:
-                logger.warning(f"Gemini API failure (attempt {attempt + 1}/{max_retries}): {e}. Retrying with gemini-2.5-flash in 10 seconds...")
-                time.sleep(10)
-            else:
-                logger.error(f"Gemini API failure after {max_retries} attempts: {e}")
-                return None
+    full_prompt = prompt + json.dumps(condensed_segments, indent=2)
+    raw = _call_llm(full_prompt, json_mode=True)
+    result = json.loads(raw)
+    
+    # Normalize: if LLM returned a list instead of dict, wrap it
+    if isinstance(result, list):
+        result = {"segments": result, "full_natural_script": ""}
+    if "segments" not in result:
+        result = {"segments": result.get("data", []), "full_natural_script": result.get("full_natural_script", "")}
+    
+    return result
 
 def estimate_tts_duration(text: str, target_lang: str = 'nepali') -> float:
     """Estimate how long TTS will speak the text, using per-language speaking rate."""
@@ -229,14 +391,9 @@ def timing_inspector(script: dict, original_segments: list, target_lang: str = '
         logger.info(f"[Timing Inspector Pass {pass_num}] ✓ All {lang_title} segments within ±{int(TIMING_TOLERANCE*100)}% tolerance.")
         return script
 
-    logger.info(f"[Timing Inspector Pass {pass_num}] Sending {len(issues)} {lang_title} segments to Gemini for timing correction...")
+    logger.info(f"[Timing Inspector Pass {pass_num}] Sending {len(issues)} {lang_title} segments for timing correction...")
 
-    # ── Gemini rewrite ───────────────────────────────
-    try:
-        client = genai.Client()
-    except Exception as e:
-        logger.error(f"Timing Inspector: Cannot init Gemini — {e}")
-        return script
+    script_name = 'देवनागरी (Devanagari)' if lang_title in ('Hindi', 'Nepali') else lang_title
 
     INSPECTOR_PROMPT = f"""
 You are a professional {lang_title} dubbing script timing editor working on a YouTube video.
@@ -260,10 +417,12 @@ For each segment below apply these rules:
 
 CRITICAL CONSTRAINTS:
   1. Preserve meaning of original_english exactly
-  2. Write natural spoken {lang_title} (informal, storytelling tone)
-  3. Final character count MUST be within ±10% of target_char_count
-  4. Do NOT include the emotion label in the translated text itself
-  5. Return ONLY a valid JSON array — no markdown, no explanation, no extra keys
+  2. Write in {script_name} script ONLY — zero Romanized text
+  3. Use professional narrator tone — NO casual fillers (yaar, bro, na, toh)
+  4. Translate ALL English words to proper {lang_title} vocabulary
+  5. Final character count MUST be within ±10% of target_char_count
+  6. Do NOT include the emotion label in the translated text itself
+  7. Return ONLY a valid JSON array — no markdown, no explanation, no extra keys
 
 Output format:
 [
@@ -272,64 +431,48 @@ Output format:
 
 Segments to fix:
 """
-    import time
-    max_retries = 3
-    corrections = None
-    for attempt in range(max_retries):
-        try:
-            response = client.models.generate_content(
-                model='gemini-2.5-flash',
-                contents=INSPECTOR_PROMPT + json.dumps(issues, ensure_ascii=False, indent=2),
-                config=types.GenerateContentConfig(response_mime_type="application/json")
-            )
-            corrections = json.loads(response.text)
-            break
-        except Exception as e:
-            if attempt < max_retries - 1:
-                logger.warning(f"Timing Inspector Gemini error (attempt {attempt + 1}/{max_retries}): {e}. Retrying with gemini-2.5-flash in 10 seconds...")
-                time.sleep(10)
-            else:
-                logger.error(f"Timing Inspector Gemini error after {max_retries} attempts: {e}")
-                return script
+    full_prompt = INSPECTOR_PROMPT + json.dumps(issues, ensure_ascii=False, indent=2)
+    raw = _call_llm(full_prompt, json_mode=True)
+    corrections = json.loads(raw)
                 
     if not isinstance(corrections, list):
         logger.warning("Timing Inspector: Gemini returned unexpected format, skipping corrections.")
         return script
 
-        # Apply corrections and log diff
-        corrections_map = {c.get('id'): c for c in corrections if isinstance(c, dict)}
-        corrected = 0
-        for seg in script['segments']:
-            seg_id = seg.get('id')
-            if seg_id not in corrections_map:
-                continue
-            old_text = seg.get('translated_text', '')
-            new_text = corrections_map[seg_id].get('translated_text', old_text)
-            orig     = orig_by_id.get(seg_id, {})
-            dur      = orig.get('end', 0) - orig.get('start', 0)
-            old_est  = estimate_tts_duration(old_text, target_lang)
-            new_est  = estimate_tts_duration(new_text, target_lang)
-            logger.info(
-                f"  ✎ Seg {seg_id}: [{len(old_text)}c ~{old_est:.1f}s] → [{len(new_text)}c ~{new_est:.1f}s] (slot={dur:.1f}s)"
-            )
-            seg['translated_text'] = new_text
-            corrected += 1
+    # Apply corrections and log diff
+    corrections_map = {c.get('id'): c for c in corrections if isinstance(c, dict)}
+    corrected = 0
+    for seg in script['segments']:
+        seg_id = seg.get('id')
+        if seg_id not in corrections_map:
+            continue
+        old_text = seg.get('translated_text', '')
+        new_text = corrections_map[seg_id].get('translated_text', old_text)
+        orig     = orig_by_id.get(seg_id, {})
+        dur      = orig.get('end', 0) - orig.get('start', 0)
+        old_est  = estimate_tts_duration(old_text, target_lang)
+        new_est  = estimate_tts_duration(new_text, target_lang)
+        logger.info(
+            f"  ✎ Seg {seg_id}: [{len(old_text)}c ~{old_est:.1f}s] → [{len(new_text)}c ~{new_est:.1f}s] (slot={dur:.1f}s)"
+        )
+        seg['translated_text'] = new_text
+        corrected += 1
 
-        logger.info(f"[Timing Inspector Pass {pass_num}] Applied {corrected} corrections.")
+    logger.info(f"[Timing Inspector Pass {pass_num}] Applied {corrected} corrections.")
 
-        # ── Recursive second pass if still issues remain ──
-        if pass_num < MAX_INSPECT_PASSES:
-            return timing_inspector(script, original_segments, target_lang, pass_num + 1)
-        else:
-            logger.info(f"[Timing Inspector] Finished {lang_title} after {pass_num} pass(es).")
-            return script
+    # ── Recursive second pass if still issues remain ──
+    if pass_num < MAX_INSPECT_PASSES:
+        return timing_inspector(script, original_segments, target_lang, pass_num + 1)
+    else:
+        logger.info(f"[Timing Inspector] Finished {lang_title} after {pass_num} pass(es).")
+        return script
 
 
 
 class TranscriberAgent:
     def __init__(self):
         # Allow user to specify env variables cleanly via .env template
-        load_dotenv(project_root / ".env")
+        load_dotenv(project_root / ".env", override=True)
         
         # User requested specific rename for the original script directory
         self.original_dir = get_agent_output_dir("transcriber", "original_voiceover_transcription")
@@ -384,8 +527,8 @@ class TranscriberAgent:
                 script_json = translate_and_emotion(raw_json, target_lang=lang_title)
 
                 if not script_json:
-                    logger.error(f"Failed to generate {lang_title} script — skipping.")
-                    continue
+                    logger.error(f"Failed to generate {lang_title} script — aborting job to trigger frontend error.")
+                    sys.exit(1)
 
                 # 3. TIMING INSPECTOR
                 logger.info(f"━━━ TIMING INSPECTOR [{lang_title}]: Checking alignment... ━━━")
